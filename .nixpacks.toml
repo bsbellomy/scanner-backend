@@ -1,0 +1,2 @@
+[phases.setup]
+nixPkgs = ["git", "cmake", "make", "pkg-config", "gcc", "g++", "python3"]
