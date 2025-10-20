@@ -4,7 +4,8 @@
   "description": "Document scanner with OpenCV, Sharp, and PDF generation",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "postinstall": "npm rebuild @u4/opencv4nodejs --build-from-source"
   },
   "dependencies": {
     "@u4/opencv4nodejs": "^6.1.0",
