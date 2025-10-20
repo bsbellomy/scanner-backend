@@ -1,14 +1,17 @@
 [phases.setup]
+# Only essential build tools here
 nixPkgs = ["cmake", "make", "pkg-config", "gcc", "g++", "python3"]
 
 [phases.install]
+# Make sure git exists before npm install
 cmds = [
-  "apt-get update && apt-get install -y git",  # ensures git exists
+  "apt-get update && apt-get install -y git",
   "git --version",
   "npm install"
 ]
 
 [phases.build]
+# Rebuild OpenCV after npm install
 cmds = ["npx opencv-build-npm rebuild --jobs max"]
 
 [start]
