@@ -1,9 +1,10 @@
 [phases.setup]
-nixPkgs = ["git", "cmake", "make", "pkg-config", "gcc", "g++", "python3"]
+nixPkgs = ["cmake", "make", "pkg-config", "gcc", "g++", "python3"]
 
 [phases.install]
 cmds = [
-    "git --version || true",   # make sure git is available
+    "apt-get update && apt-get install -y git",  # <-- ensures git exists
+    "git --version",
     "npm install"
 ]
 
