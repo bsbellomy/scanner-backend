@@ -1,9 +1,11 @@
 [phases.setup]
 nixPkgs = ["git", "cmake", "make", "pkg-config", "gcc", "g++", "python3"]
-aptPkgs = ["git"]
 
 [phases.install]
-cmds = ["npm install"]
+cmds = [
+    "git --version || true",   # make sure git is available
+    "npm install"
+]
 
 [phases.build]
 cmds = ["npx opencv-build-npm rebuild --jobs max"]
