@@ -1,7 +1,6 @@
-# Use Node 20 base image
 FROM node:20-bullseye
 
-# Install all build dependencies and OpenCV requirements
+# 1. Install dependencies for full OpenCV + Node build
 RUN apt-get update && apt-get install -y \
     build-essential \
     cmake \
@@ -20,24 +19,27 @@ RUN apt-get update && apt-get install -y \
     python3 \
     && rm -rf /var/lib/apt/lists/*
 
-# Set working directory
+# 2. Set workdir
 WORKDIR /app
 
-# Copy dependency manifests
+# 3. Copy package files
 COPY package*.json ./
 
-# Install Node dependencies (includes @u4/opencv4nodejs)
+# 4. Install Node dependencies
 RUN npm install
 
-# Force OpenCV build using opencv-build-npm
+# 5. Build OpenCV itself (downloads & compiles C++ libs)
 RUN npx opencv-build-npm rebuild --jobs max
 
-# ✅ Verify native module exists after build
-RUN ls -l node_modules/@u4/opencv4nodejs/build/Release || (echo "opencv4nodejs build folder missing!" && exit 1)
-RUN test -f node_modules/@u4/opencv4nodejs/build/Release/opencv4nodejs.node || (echo "OpenCV build failed!" && exit 1)
+# 6. Build the native Node bindings (the actual opencv4nodejs.node)
+RUN npm rebuild @u4/opencv4nodejs --build-from-source
 
-# Copy rest of app
+# 7. Verify native module exists
+RUN test -f node_modules/@u4/opencv4nodejs/build/Release/opencv4nodejs.node || \
+    (echo "❌ OpenCV node module build failed!" && exit 1)
+
+# 8. Copy rest of app
 COPY . .
 
-# Start your app
+# 9. Start command
 CMD ["npm", "start"]
