@@ -15,9 +15,17 @@ WORKDIR /app
 # Copy package files
 COPY package*.json ./
 
-# Install Node dependencies and build OpenCV
-RUN npm install && \
-    npx opencv-build-npm rebuild
+# Install dependencies
+RUN npm install
+
+# Build OpenCV - with explicit output directory
+ENV OPENCV4NODEJS_AUTOBUILD_OPENCV_VERSION=4.5.5
+ENV OPENCV4NODEJS_DISABLE_AUTOBUILD=0
+RUN npx opencv-build-npm rebuild
+
+# Verify build succeeded
+RUN test -f /app/node_modules/@u4/opencv4nodejs/build/Release/opencv4nodejs.node || \
+    (echo "OpenCV build failed!" && exit 1)
 
 # Copy application code
 COPY . .
