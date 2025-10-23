@@ -1,12 +1,3 @@
-const express = require('express');
-const multer = require('multer');
-const sharp = require('sharp');
-const { PDFDocument } = require('pdf-lib');
-const cv = require('@u4/opencv4nodejs');
-
-const app = express();
-const upload = multer({ storage: multer.memoryStorage() });
-
 app.post('/process-scan', upload.array('images'), async (req, res) => {
   try {
     if (!req.files || req.files.length === 0) {
@@ -17,7 +8,6 @@ app.post('/process-scan', upload.array('images'), async (req, res) => {
     const debugInfo = [];
     
     for (let file of req.files) {
-      // Decode image
       let img = cv.imdecode(file.buffer);
       const originalHeight = img.rows;
       const originalWidth = img.cols;
@@ -26,7 +16,7 @@ app.post('/process-scan', upload.array('images'), async (req, res) => {
       
       // Resize for processing
       let workingImg = img;
-      const maxDim = 1200;
+      const maxDim = 1000;
       if (img.cols > maxDim || img.rows > maxDim) {
         const scale = maxDim / Math.max(img.cols, img.rows);
         workingImg = img.resize(
@@ -38,21 +28,22 @@ app.post('/process-scan', upload.array('images'), async (req, res) => {
       // Convert to grayscale
       const gray = workingImg.bgrToGray();
       
-      // Apply Gaussian blur
+      // Blur
       const blurred = gray.gaussianBlur(new cv.Size(5, 5), 0);
       
-      // ADAPTIVE THRESHOLDING - finds light areas (document) vs dark (background)
-      const thresh = blurred.adaptiveThreshold(
-        255,
-        cv.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv.THRESH_BINARY,
-        115,  // Large block size to ignore texture
-        10
-      );
+      // OTSU threshold (automatic)
+      const thresh = blurred.threshold(0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
       
-      // Morphological closing to fill gaps
-      const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(15, 15));
-      const closed = thresh.morphologyEx(kernel, cv.MORPH_CLOSE);
+      // Check if document is light or dark - invert if needed
+      const mean = thresh.mean();
+      const binary = mean > 127 ? thresh.bitwiseNot() : thresh;
+      
+      // Morphology: remove noise, close gaps
+      const kernel1 = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(5, 5));
+      const opened = binary.morphologyEx(kernel1, cv.MORPH_OPEN);
+      
+      const kernel2 = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(20, 20));
+      const closed = opened.morphologyEx(kernel2, cv.MORPH_CLOSE);
       
       // Find contours
       const contours = closed.findContours(
@@ -69,92 +60,89 @@ app.post('/process-scan', upload.array('images'), async (req, res) => {
       let transformed = false;
       const imageArea = workingImg.rows * workingImg.cols;
       
-      // Look for large rectangular contours
-      for (let i = 0; i < Math.min(5, sorted.length); i++) {
+      // Look for document (should be 30-95% of image)
+      for (let i = 0; i < Math.min(10, sorted.length); i++) {
         const contour = sorted[i];
         const area = contour.area;
         const areaPercent = (area / imageArea) * 100;
         
-        debugInfo.push(`Contour ${i}: ${areaPercent.toFixed(1)}% of image`);
-        
-        if (areaPercent < 40) {
-          debugInfo.push(`  Too small, skipping`);
+        // Skip if too big (99%+ = whole image) or too small
+        if (areaPercent > 98 || areaPercent < 25) {
+          debugInfo.push(`Contour ${i}: ${areaPercent.toFixed(1)}% - skip (too ${areaPercent > 98 ? 'big' : 'small'})`);
           continue;
         }
         
-        // Approximate to polygon
-        const peri = contour.arcLength(true);
-        const approx = contour.approxPolyDP(0.02 * peri, true);
+        debugInfo.push(`Contour ${i}: ${areaPercent.toFixed(1)}% - checking...`);
         
-        // Extract points - FIXED METHOD
-        let srcPoints = [];
-        try {
-          // Method 1: Try accessing as NumericArray
-          for (let j = 0; j < approx.sizes[0]; j++) {
-            const x = approx.at(j, 0).x;
-            const y = approx.at(j, 0).y;
-            srcPoints.push([x, y]);
-          }
-        } catch (e1) {
+        // Approximate
+        const peri = contour.arcLength(true);
+        
+        // Try multiple epsilon values
+        for (let eps = 0.01; eps <= 0.05; eps += 0.01) {
+          const approx = contour.approxPolyDP(eps * peri, true);
+          
+          // Extract points
+          let srcPoints = [];
           try {
-            // Method 2: Direct iteration
             for (let j = 0; j < approx.rows; j++) {
-              srcPoints.push([approx.at(j).x, approx.at(j).y]);
+              const pt = approx.at(j);
+              srcPoints.push([pt.x, pt.y]);
             }
-          } catch (e2) {
-            debugInfo.push(`  Failed to extract points: ${e2.message}`);
+          } catch (e) {
             continue;
           }
-        }
-        
-        const numPoints = srcPoints.length;
-        debugInfo.push(`  ${numPoints} corners`);
-        
-        if (numPoints === 4) {
-          debugInfo.push(`  ✓ Quadrilateral found!`);
           
-          // Scale back to original size
-          if (workingImg.cols !== originalWidth) {
-            const scaleX = originalWidth / workingImg.cols;
-            const scaleY = originalHeight / workingImg.rows;
-            srcPoints = srcPoints.map(p => [p[0] * scaleX, p[1] * scaleY]);
-          }
+          const numPoints = srcPoints.length;
           
-          // Order corners
-          const ordered = orderPoints(srcPoints);
-          debugInfo.push(`  Corners: ${JSON.stringify(ordered.map(p => p.map(n => Math.round(n))))}`);
-          
-          // Destination: A4 300dpi
-          const dstWidth = 2480;
-          const dstHeight = 3508;
-          const dst = [
-            [0, 0],
-            [dstWidth - 1, 0],
-            [dstWidth - 1, dstHeight - 1],
-            [0, dstHeight - 1]
-          ];
-          
-          try {
-            const M = cv.getPerspectiveTransform(
-              ordered.map(p => new cv.Point2(p[0], p[1])),
-              dst.map(p => new cv.Point2(p[0], p[1]))
-            );
+          if (numPoints === 4) {
+            debugInfo.push(`  ✓ Found 4 corners with ε=${eps.toFixed(2)}`);
             
-            processedImage = img.warpPerspective(M, new cv.Size(dstWidth, dstHeight));
-            transformed = true;
-            debugInfo.push(`  ✓ Transform successful!`);
-            break;
-          } catch (e) {
-            debugInfo.push(`  ✗ Transform error: ${e.message}`);
+            // Scale to original
+            if (workingImg.cols !== originalWidth) {
+              const scaleX = originalWidth / workingImg.cols;
+              const scaleY = originalHeight / workingImg.rows;
+              srcPoints = srcPoints.map(p => [p[0] * scaleX, p[1] * scaleY]);
+            }
+            
+            // Order
+            const ordered = orderPoints(srcPoints);
+            
+            // Transform
+            const dstWidth = 2480;
+            const dstHeight = 3508;
+            const dst = [
+              [0, 0],
+              [dstWidth - 1, 0],
+              [dstWidth - 1, dstHeight - 1],
+              [0, dstHeight - 1]
+            ];
+            
+            try {
+              const M = cv.getPerspectiveTransform(
+                ordered.map(p => new cv.Point2(p[0], p[1])),
+                dst.map(p => new cv.Point2(p[0], p[1]))
+              );
+              
+              processedImage = img.warpPerspective(M, new cv.Size(dstWidth, dstHeight));
+              transformed = true;
+              debugInfo.push(`  ✓ Transform successful!`);
+              break;
+            } catch (e) {
+              debugInfo.push(`  ✗ Transform failed: ${e.message}`);
+            }
+          } else {
+            debugInfo.push(`  ${numPoints} corners (need 4)`);
           }
         }
+        
+        if (transformed) break;
       }
       
-      debugInfo.push(`Result: ${transformed ? 'TRANSFORMED' : 'FALLBACK CROP'}`);
+      debugInfo.push(`Result: ${transformed ? 'TRANSFORMED ✓' : 'FALLBACK CROP'}`);
       
       // Fallback
       if (!transformed) {
-        const crop = 0.03;  // Only 3% crop
+        const crop = 0.02;
         const x = Math.floor(img.cols * crop);
         const y = Math.floor(img.rows * crop);
         const w = Math.floor(img.cols * (1 - 2 * crop));
@@ -165,11 +153,11 @@ app.post('/process-scan', upload.array('images'), async (req, res) => {
       // Encode
       const buffer = cv.imencode('.jpg', processedImage);
       
-      // Enhance with Sharp
+      // Enhance
       const enhanced = await sharp(buffer)
         .resize(2480, 3508, { fit: 'inside' })
         .normalize()
-        .sharpen({ sigma: 1.0 })
+        .sharpen()
         .toBuffer();
       
       // Add to PDF
@@ -193,35 +181,6 @@ app.post('/process-scan', upload.array('images'), async (req, res) => {
     
   } catch (error) {
     console.error('Error:', error);
-    res.status(500).json({ error: error.message, stack: error.stack });
+    res.status(500).json({ error: error.message });
   }
-});
-
-function orderPoints(pts) {
-  // Sum of coordinates: TL has smallest, BR has largest
-  const summed = pts.map(p => ({ p, sum: p[0] + p[1] }));
-  summed.sort((a, b) => a.sum - b.sum);
-  
-  const tl = summed[0].p;
-  const br = summed[3].p;
-  
-  // Difference: TR has positive diff, BL has negative
-  const remaining = [summed[1].p, summed[2].p];
-  const diffed = remaining.map(p => ({ p, diff: p[1] - p[0] }));
-  diffed.sort((a, b) => a.diff - b.diff);
-  
-  const tr = diffed[1].p;
-  const bl = diffed[0].p;
-  
-  return [tl, tr, br, bl];
-}
-
-app.get('/health', (req, res) => {
-  res.json({ status: 'ok', opencv: cv.version });
-});
-
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`Scanner backend running on port ${PORT}`);
-  console.log(`OpenCV version: ${cv.version.major}.${cv.version.minor}.${cv.version.revision}`);
 });
