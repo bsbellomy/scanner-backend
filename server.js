@@ -69,7 +69,7 @@ app.post('/process-scan', upload.array('images'), async (req, res) => {
       let transformed = false;
       const imageArea = workingImg.rows * workingImg.cols;
       
-      // Look for large rectangular contours (50%+ of image = likely the document)
+      // Look for large rectangular contours
       for (let i = 0; i < Math.min(5, sorted.length); i++) {
         const contour = sorted[i];
         const area = contour.area;
@@ -85,18 +85,33 @@ app.post('/process-scan', upload.array('images'), async (req, res) => {
         // Approximate to polygon
         const peri = contour.arcLength(true);
         const approx = contour.approxPolyDP(0.02 * peri, true);
-        const points = approx.getDataAsArray();
         
-        debugInfo.push(`  ${points.length} corners`);
+        // Extract points - FIXED METHOD
+        let srcPoints = [];
+        try {
+          // Method 1: Try accessing as NumericArray
+          for (let j = 0; j < approx.sizes[0]; j++) {
+            const x = approx.at(j, 0).x;
+            const y = approx.at(j, 0).y;
+            srcPoints.push([x, y]);
+          }
+        } catch (e1) {
+          try {
+            // Method 2: Direct iteration
+            for (let j = 0; j < approx.rows; j++) {
+              srcPoints.push([approx.at(j).x, approx.at(j).y]);
+            }
+          } catch (e2) {
+            debugInfo.push(`  Failed to extract points: ${e2.message}`);
+            continue;
+          }
+        }
         
-        if (points.length === 4) {
+        const numPoints = srcPoints.length;
+        debugInfo.push(`  ${numPoints} corners`);
+        
+        if (numPoints === 4) {
           debugInfo.push(`  ✓ Quadrilateral found!`);
-          
-          // Extract and scale points
-          let srcPoints = points.map(pt => {
-            const p = Array.isArray(pt[0]) ? pt[0] : [pt.x || pt[0], pt.y || pt[1]];
-            return p;
-          });
           
           // Scale back to original size
           if (workingImg.cols !== originalWidth) {
@@ -107,6 +122,7 @@ app.post('/process-scan', upload.array('images'), async (req, res) => {
           
           // Order corners
           const ordered = orderPoints(srcPoints);
+          debugInfo.push(`  Corners: ${JSON.stringify(ordered.map(p => p.map(n => Math.round(n))))}`);
           
           // Destination: A4 300dpi
           const dstWidth = 2480;
@@ -170,26 +186,26 @@ app.post('/process-scan', upload.array('images'), async (req, res) => {
     
     const pdfBytes = await pdfDoc.save();
     
-    res.setHeader('X-Debug-Info', JSON.stringify(debugInfo));
+    res.setHeader('X-Debug-Info', JSON.stringify(debugInfo).substring(0, 8000));
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', 'attachment; filename=scan.pdf');
     res.send(Buffer.from(pdfBytes));
     
   } catch (error) {
     console.error('Error:', error);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: error.message, stack: error.stack });
   }
 });
 
 function orderPoints(pts) {
   // Sum of coordinates: TL has smallest, BR has largest
-  const summed = pts.map((p, i) => ({ p, sum: p[0] + p[1], i }));
+  const summed = pts.map(p => ({ p, sum: p[0] + p[1] }));
   summed.sort((a, b) => a.sum - b.sum);
   
   const tl = summed[0].p;
   const br = summed[3].p;
   
-  // Difference: TR has positive, BL has negative
+  // Difference: TR has positive diff, BL has negative
   const remaining = [summed[1].p, summed[2].p];
   const diffed = remaining.map(p => ({ p, diff: p[1] - p[0] }));
   diffed.sort((a, b) => a.diff - b.diff);
