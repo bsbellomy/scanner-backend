@@ -24,6 +24,8 @@ app.post('/process-scan', upload.array('images'), async (req, res) => {
       const originalHeight = img.rows;
       const originalWidth = img.cols;
       
+      debugInfo.push(`Original image: ${originalWidth}x${originalHeight}`);
+      
       // Resize if too large (for faster processing)
       let workingImg = img;
       const maxDimension = 1500;
@@ -35,66 +37,90 @@ app.post('/process-scan', upload.array('images'), async (req, res) => {
         );
       }
       
-      // Convert to grayscale for edge detection
+      // Convert to grayscale
       const gray = workingImg.bgrToGray();
       
-      // Apply bilateral filter to reduce noise while keeping edges sharp
+      // Apply bilateral filter to reduce noise while keeping edges
       const filtered = gray.bilateralFilter(9, 75, 75);
       
-      // Edge detection using Canny
-      const edges = filtered.canny(30, 100);
+      // Edge detection with Canny
+      const edges = filtered.canny(50, 200);
       
-      // Dilate to close gaps in edges
+      // Dilate to close gaps
       const kernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(5, 5));
       const dilated = edges.dilate(kernel);
       
       // Find contours
       const contours = dilated.findContours(
-        cv.RETR_EXTERNAL,
+        cv.RETR_LIST,
         cv.CHAIN_APPROX_SIMPLE
       );
       
       debugInfo.push(`Found ${contours.length} contours`);
       
-      // Sort by area
+      // Sort by area (largest first)
       const sortedContours = contours.sort((a, b) => b.area - a.area);
       
       let processedImage = img;
       let transformed = false;
       const imageArea = workingImg.rows * workingImg.cols;
       
-      // Try to find document contour (much more lenient)
+      // Try to find document contour
       for (let i = 0; i < Math.min(10, sortedContours.length); i++) {
         const contour = sortedContours[i];
+        const contourArea = contour.area;
+        const areaPercent = (contourArea / imageArea) * 100;
+        
+        // Skip if too small
+        if (areaPercent < 15) {
+          debugInfo.push(`Contour ${i}: ${areaPercent.toFixed(1)}% - too small, skipping`);
+          continue;
+        }
+        
         const peri = contour.arcLength(true);
         
-        // Try different approximation values
-        for (let epsilon = 0.01; epsilon <= 0.05; epsilon += 0.01) {
-          const approx = contour.approxPolyDP(epsilon * peri, true);
-          const contourArea = contour.area;
-          const areaPercent = (contourArea / imageArea) * 100;
+        // Try multiple epsilon values for approximation
+        for (let epsilonFactor = 0.01; epsilonFactor <= 0.08; epsilonFactor += 0.01) {
+          const approx = contour.approxPolyDP(epsilonFactor * peri, true);
           
-          debugInfo.push(`Contour ${i}, epsilon ${epsilon.toFixed(2)}: ${approx.rows} points, ${areaPercent.toFixed(1)}% of image`);
+          // Get points array - THIS IS THE FIX
+          const points = approx.getDataAsArray();
+          const numPoints = points.length;
           
-          // Accept if it's a quadrilateral and takes up significant space (lowered to 20%)
-          if (approx.rows === 4 && areaPercent > 20) {
-            debugInfo.push(`✓ Using this contour!`);
+          debugInfo.push(`  Contour ${i}, ε=${epsilonFactor.toFixed(2)}: ${numPoints} points, ${areaPercent.toFixed(1)}% area`);
+          
+          // We want exactly 4 corners (quadrilateral)
+          if (numPoints === 4) {
+            debugInfo.push(`  ✓ Found quadrilateral!`);
             
-            // Get corner points
-            let srcPoints = approx.getDataAsArray().map(pt => pt[0]);
+            // Extract corner coordinates
+            let srcPoints = points.map(pt => {
+              // Handle nested array format [[x, y]]
+              if (Array.isArray(pt) && Array.isArray(pt[0])) {
+                return [pt[0][0], pt[0][1]];
+              }
+              // Handle {x, y} object format
+              if (pt.x !== undefined && pt.y !== undefined) {
+                return [pt.x, pt.y];
+              }
+              // Already in [x, y] format
+              return pt;
+            });
             
-            // Scale points back to original image size if we resized
+            // Scale points back to original image size
             if (workingImg.cols !== originalWidth) {
               const scaleX = originalWidth / workingImg.cols;
               const scaleY = originalHeight / workingImg.rows;
               srcPoints = srcPoints.map(pt => [pt[0] * scaleX, pt[1] * scaleY]);
             }
             
+            debugInfo.push(`  Source points: ${JSON.stringify(srcPoints)}`);
+            
             // Order points: top-left, top-right, bottom-right, bottom-left
             const orderedPoints = orderPoints(srcPoints);
             
-            // Calculate dimensions for output
-            const width = 2480;  // A4 at 300 DPI
+            // Calculate output dimensions (A4 at 300 DPI)
+            const width = 2480;
             const height = 3508;
             
             const dstPoints = [
@@ -105,30 +131,31 @@ app.post('/process-scan', upload.array('images'), async (req, res) => {
             ];
             
             try {
-              // Perspective transform
-              const M = cv.getPerspectiveTransform(orderedPoints, dstPoints);
+              // Perform perspective transform
+              const M = cv.getPerspectiveTransform(
+                orderedPoints.map(p => new cv.Point2(p[0], p[1])),
+                dstPoints.map(p => new cv.Point2(p[0], p[1]))
+              );
+              
               processedImage = img.warpPerspective(M, new cv.Size(width, height));
               transformed = true;
-              debugInfo.push('Transform successful!');
+              debugInfo.push('  ✓ Perspective transform successful!');
+              break;
             } catch (e) {
-              debugInfo.push(`Transform failed: ${e.message}`);
+              debugInfo.push(`  ✗ Transform failed: ${e.message}`);
             }
-            
-            if (transformed) break;
           }
         }
         
         if (transformed) break;
       }
       
-      debugInfo.push(`Final result: Transformed = ${transformed}`);
+      debugInfo.push(`Result: Transformed = ${transformed}`);
       
-      // If no transformation, do smart cropping
+      // Fallback: smart crop if no transform
       if (!transformed) {
-        debugInfo.push('No valid quadrilateral found - applying smart crop');
-        
-        // Crop 8% from each edge
-        const cropPercent = 0.08;
+        debugInfo.push('Applying fallback crop (10% border removal)');
+        const cropPercent = 0.10;
         const cropX = Math.floor(img.cols * cropPercent);
         const cropY = Math.floor(img.rows * cropPercent);
         const cropWidth = Math.floor(img.cols * (1 - 2 * cropPercent));
@@ -142,11 +169,11 @@ app.post('/process-scan', upload.array('images'), async (req, res) => {
       // Convert to buffer
       const buffer = cv.imencode('.jpg', processedImage);
       
-      // Enhance with Sharp (keep color)
+      // Enhance with Sharp (KEEP COLOR)
       const enhanced = await sharp(buffer)
         .resize(2480, 3508, { fit: 'inside' })
         .normalize()  // Improve contrast
-        .sharpen()     // Sharpen text
+        .sharpen({ sigma: 1.5 })  // Sharpen text
         .toBuffer();
       
       // Add to PDF
@@ -164,8 +191,8 @@ app.post('/process-scan', upload.array('images'), async (req, res) => {
     
     const pdfBytes = await pdfDoc.save();
     
-    // Add debug info to response headers
-    res.setHeader('X-Debug-Info', JSON.stringify(debugInfo));
+    // Return debug info in header
+    res.setHeader('X-Debug-Info', JSON.stringify(debugInfo).substring(0, 8000)); // Limit header size
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', 'attachment; filename=scan.pdf');
     res.send(Buffer.from(pdfBytes));
@@ -174,41 +201,38 @@ app.post('/process-scan', upload.array('images'), async (req, res) => {
     console.error('Error processing scan:', error);
     res.status(500).json({ 
       error: 'Failed to process images', 
-      details: error.message,
-      stack: error.stack
+      details: error.message
     });
   }
 });
 
-// Helper function to order points clockwise from top-left
+// Order points clockwise from top-left
 function orderPoints(pts) {
-  // Calculate center
+  // Calculate centroid
   const centerX = pts.reduce((sum, pt) => sum + pt[0], 0) / 4;
   const centerY = pts.reduce((sum, pt) => sum + pt[1], 0) / 4;
   
-  // Sort by angle from center
-  const angles = pts.map(pt => ({
+  // Sort points by angle from center
+  const sortedByAngle = pts.map(pt => ({
     point: pt,
     angle: Math.atan2(pt[1] - centerY, pt[0] - centerX)
-  }));
+  })).sort((a, b) => a.angle - b.angle);
   
-  angles.sort((a, b) => a.angle - b.angle);
-  
-  // Find top-left (smallest x+y sum)
-  let minIdx = 0;
+  // Find top-left (has smallest x + y)
+  let tlIndex = 0;
   let minSum = Infinity;
   for (let i = 0; i < 4; i++) {
-    const sum = angles[i].point[0] + angles[i].point[1];
+    const sum = sortedByAngle[i].point[0] + sortedByAngle[i].point[1];
     if (sum < minSum) {
       minSum = sum;
-      minIdx = i;
+      tlIndex = i;
     }
   }
   
-  // Reorder starting from top-left, going clockwise
+  // Reorder clockwise starting from top-left
   const ordered = [];
   for (let i = 0; i < 4; i++) {
-    ordered.push(angles[(minIdx + i) % 4].point);
+    ordered.push(sortedByAngle[(tlIndex + i) % 4].point);
   }
   
   return ordered;
